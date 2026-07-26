@@ -445,7 +445,148 @@ if (hour >= 9 && hour <= 11) {
 
 
 
+Here's the notebook-style breakdown for Listeners.
 
+## What is a Listener?
+A Listener collects and displays the results of a test run — response times, status codes, throughput, errors. It doesn't affect what gets sent, only how results are shown/saved. **Important rule to note**: Listeners are heavy on memory/CPU — always disable them during actual load runs and only enable during script debugging/validation. For real load tests, log to file and analyze after.
+
+---
+
+## BUILT-IN LISTENERS
+
+**Table/Tree view (debugging)**
+- **View Results Tree** — shows request/response in full detail (headers, body, timing) per sample → best for debugging a script line-by-line, but extremely memory-heavy — never use in load tests, only in single-thread debug runs
+- **View Results in Table** — tabular summary (response code, time, bytes) per sample → lighter than Results Tree, still mainly for debugging
+
+**Summary / Aggregate stats**
+- **Summary Report** — table of stats (avg, min, max, error%, throughput) per sampler name → your main go-to for quick pass/fail review after a run
+- **Aggregate Report** — same as Summary Report but adds median, 90/95/99th percentile → this is the one you actually want for SLA reporting since percentiles matter more than averages in performance work
+- **Aggregate Graph** — same data as Aggregate Report but as a bar graph → useful for quick visual comparison across samplers
+
+**Graphs**
+- **Graph Results** — plots response time over time, live → visually intuitive during a demo, but very resource-heavy, avoid in real runs
+- **Response Time Graph** — cleaner response-time-only line graph
+- **Response Time Distribution** — distribution histogram of response times → helpful to check if response times are consistent or highly variable
+
+**Throughput-related**
+- **Transactions per Second (TPS) Listener** — Wait, this is actually available as a jpgc feature (see below), not built-in — noting this so you don't confuse it
+
+**Error-specific**
+- **Assertion Results** — shows pass/fail detail for each Assertion applied → used when debugging why a specific assertion is failing
+
+**File-based (most important for real load tests)**
+- **Simple Data Writer** — writes raw results directly to a `.jtl` file without any live UI/graphs → this is what you actually use in real load tests — enable this, disable everything else visual, then analyze the `.jtl` afterward
+
+**Backend**
+- **Backend Listener** — streams live results to an external monitoring backend (e.g., InfluxDB + Grafana, or Datadog) in real-time → this is the big one for you given your Grafana/Datadog stack — lets you watch a live dashboard during the run instead of waiting for post-test report
+
+---
+
+## PLUGIN LISTENERS (jpgc — Custom Listeners plugin)
+
+- **jp@gc - Response Times Over Time** — graph of response time trend across the run duration
+- **jp@gc - Transactions per Second** — graph of actual TPS achieved over time → directly compare against your target TPS from Throughput Shaping Timer
+- **jp@gc - Active Threads Over Time** — graph of concurrent thread count over time → useful to visually confirm your ramp-up/step shape actually executed as designed
+- **jp@gc - Response Codes per Second** — graph of status codes (200, 500, etc.) over time → quickly spot when errors started spiking
+- **jp@gc - Bytes Throughput Over Time** — network throughput graph → useful for bandwidth-constrained scenarios
+- **jp@gc - Response Latencies Over Time** — latency (time to first byte) specifically, separate from full response time
+- **jp@gc - PerfMon Metrics Collector** — displays CPU/memory/disk stats from the PerfMon Server Agent running on the SUT → pairs with your Dynatrace/Datadog monitoring to correlate JMeter load with server-side resource usage directly inside JMeter itself
+
+---
+
+## SIMPLE TABLE FOR YOUR NOTEBOOK
+
+| Listener | Purpose | When to use |
+|---|---|---|
+| View Results Tree | Full request/response detail | Script debugging only |
+| View Results in Table | Tabular per-sample detail | Light debugging |
+| Summary Report | Basic stats (avg/min/max/error%) | Quick post-run check |
+| Aggregate Report | Adds percentiles (90/95/99th) | SLA reporting — main one |
+| Aggregate Graph | Bar graph of aggregate stats | Visual comparison |
+| Response Time Graph | Live response time trend | Demo/visual only |
+| Response Time Distribution | Histogram of response times | Consistency check |
+| Assertion Results | Pass/fail detail per assertion | Debugging failed assertions |
+| Simple Data Writer | Writes raw results to .jtl file | **Real load tests — always use this** |
+| Backend Listener | Streams live data to Grafana/Datadog/InfluxDB | Live dashboard during run |
+| jp@gc Transactions per Second | TPS achieved over time | Compare vs target TPS |
+| jp@gc Active Threads Over Time | Thread ramp shape verification | Confirm load shape executed correctly |
+| jp@gc Response Codes per Second | Error spike timing | Spot when failures started |
+| jp@gc PerfMon Metrics Collector | Server CPU/mem/disk in JMeter | Correlate load with server resources |
+
+**Golden rule for your actual test runs**: disable all UI listeners (Results Tree, Graph Results, View Results in Table) → keep only **Simple Data Writer** (writes to `.jtl`) and optionally **Backend Listener** (if streaming to Grafana live) → generate the **HTML Dashboard Report** from the `.jtl` file after the run completes (`jmeter -g results.jtl -o /report-folder`) for the full percentile/graph breakdown.
+
+Given your Dynatrace/Datadog/Grafana background, **Backend Listener + PerfMon Metrics Collector** is the combo most worth mastering — it lets you correlate JMeter-side load metrics with server-side resource metrics in one place instead of cross-referencing two separate tools after the fact.
+
+Here's the notebook-style breakdown for Assertions.
+
+## What is an Assertion?
+An Assertion checks whether the response is actually correct — not just "did I get a response" but "is this the right response." Without assertions, JMeter only flags HTTP-level failures (like 500 errors) — it won't catch a "200 OK" response that silently returns wrong or broken data. This is where real functional validation happens inside a performance test.
+
+---
+
+## BUILT-IN ASSERTIONS
+
+**Response content checks**
+- **Response Assertion** — checks response body/headers/code against text, regex, or "contains/matches/equals" pattern → your most-used assertion, e.g., checking response contains "SUCCESS" or doesn't contain "error"
+- **Size Assertion** — checks response size (bytes) is within expected range → used to catch truncated/incomplete responses that still return 200 OK
+
+**Structured data checks**
+- **JSON Assertion** — validates a JSON path exists and optionally matches an expected value → used heavily in modern REST API testing, e.g., checking `$.orderStatus` equals `"CONFIRMED"`
+- **JSON JMESPath Assertion** — same idea as JSON Assertion but uses JMESPath query syntax (more powerful filtering/expressions) → used for complex nested JSON validation
+- **XPath Assertion / XPath2 Assertion** — validates XML response structure/value using XPath → used for SOAP/XML-based legacy telecom systems
+- **XML Assertion** — simply checks the response is well-formed XML → basic structural check, not value-based
+
+**Timing checks**
+- **Duration Assertion** — fails the sample if response time exceeds a set threshold (ms) → used to enforce SLA response-time limits directly in the script (e.g., fail if >2000ms), separate from just reporting slow times later
+
+**Protocol-specific**
+- **HTML Assertion** — validates response HTML against W3C/JTidy standards → rare, used for strict HTML-compliance checking, not typical in API/backend testing
+- **SOAP Assertion / SMIME Assertion** — SOAP-specific and email-signature-specific checks → niche, legacy SOAP systems only
+
+**Comparison**
+- **Compare Assertion** — compares response of a sampler against a previous "baseline" response → used in regression-style testing, verifying response hasn't unexpectedly changed between test runs
+
+**Scripted**
+- **JSR223 Assertion** — write custom Groovy logic to decide pass/fail → used when validation logic is too complex for standard assertions (e.g., cross-checking two different response fields against each other, or a calculated business rule)
+
+**BeanShell Assertion**
+- Older scripting version → avoid, use JSR223 Assertion instead
+
+---
+
+## Assertion helper (not an assertion itself, but pairs with it)
+
+- **Assertion Results (Listener)** — displays pass/fail detail for assertions, already covered under Listeners
+
+---
+
+## PLUGIN ASSERTIONS
+
+Assertions are mostly a core JMeter category — jpgc doesn't add much here since community focus went into Thread Groups/Listeners/Samplers instead. The one notable addition:
+
+- **JSON Assertion (jpgc's older plugin version, now merged into core JMeter)** — historically was a plugin, now built-in as of modern JMeter, so no separate install needed anymore
+
+---
+
+## SIMPLE TABLE FOR YOUR NOTEBOOK
+
+| Assertion | Checks | When to use |
+|---|---|---|
+| Response Assertion | Text/regex in body/headers/code | Most common — general content validation |
+| Size Assertion | Response size in bytes | Catch truncated/incomplete responses |
+| JSON Assertion | JSON path value | REST API field validation |
+| JSON JMESPath Assertion | Complex JSON queries | Nested/filtered JSON validation |
+| XPath / XPath2 Assertion | XML structure/value via XPath | SOAP/XML legacy systems |
+| XML Assertion | Well-formed XML check | Basic XML structure check |
+| Duration Assertion | Response time threshold | Enforce SLA time limits in-script |
+| HTML Assertion | HTML standard compliance | Rare, strict HTML validation |
+| SOAP Assertion | SOAP-specific checks | Legacy SOAP systems |
+| Compare Assertion | Compares against baseline response | Regression testing |
+| JSR223 Assertion | Custom scripted pass/fail logic | Complex/custom business rule validation |
+
+**Scope rule to note down** (same as Timers): an assertion applies to whatever sampler it's placed under/inside. Drop it inside one HTTP Request → only checks that one. Drop it at Thread Group level → checks every sampler in that group.
+
+For your OSS/BSS + REST/JSON work, the ones you'll use constantly are: **Response Assertion, JSON Assertion, and Duration Assertion** — that trio covers content correctness, structured data correctness, and SLA timing in nearly every script.
 
 
 
