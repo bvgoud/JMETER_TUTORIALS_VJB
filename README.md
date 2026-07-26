@@ -849,3 +849,158 @@ Logic Controllers are also a stable core category — jpgc doesn't significantly
 | Critical Section Controller | Serializes access (mutex) | Concurrency-sensitive validation |
 
 For your OSS/BSS work, the ones you'll use constantly are: **Transaction Controller** (reporting), **If Controller** (conditional retry/error handling), **ForEach Controller** (processing lists like multiple orders/subscribers), and **Once Only Controller** (login-once-per-thread pattern). **Throughput Controller** is also valuable for modeling realistic traffic splits across different customer journeys (prepaid vs postpaid vs enterprise provisioning, for example).
+
+
+
+
+
+Here's one clean Groovy example for each JSR223 element type, organized exactly by where they appear in JMeter's right-click **Add** menu.
+
+---
+
+## 1. Add → Sampler → JSR223 Sampler
+**Use case:** Custom sampler that doesn't fit HTTP/JDBC — e.g., simulate a delay-based synthetic transaction or call a Java utility class directly.
+
+```groovy
+// Simulate a custom "network provisioning check" as a sampler
+SampleResult.setSamplerData("Synthetic Provisioning Check")
+
+def startTime = System.currentTimeMillis()
+
+// simulate calling an internal validation routine
+def subscriberId = vars.get("subscriberId")
+def isValid = subscriberId != null && subscriberId.startsWith("SUB")
+
+Thread.sleep(50) // simulate processing time
+
+def endTime = System.currentTimeMillis()
+SampleResult.setStampAndTime(startTime, endTime - startTime)
+
+if (isValid) {
+    SampleResult.setResponseData("Provisioning check passed for ${subscriberId}", "UTF-8")
+    SampleResult.setSuccessful(true)
+    SampleResult.setResponseCode("200")
+} else {
+    SampleResult.setResponseData("Invalid subscriber ID", "UTF-8")
+    SampleResult.setSuccessful(false)
+    SampleResult.setResponseCode("400")
+}
+```
+**Why used:** when you need a fully custom "request" that isn't really HTTP/DB/Kafka — a placeholder synthetic check, or a wrapper calling a Java SDK method directly.
+
+---
+
+## 2. Add → Timer → JSR223 Timer
+**Use case:** Adaptive pacing based on previous response time (already covered, repeated here in its correct category slot).
+
+```groovy
+def lastResponseTime = prev?.getTime() ?: 0
+
+if (lastResponseTime > 3000) {
+    log.info("Slow response (${lastResponseTime}ms) — backing off pacing")
+    return 5000
+} else if (lastResponseTime > 1000) {
+    return 2000
+} else {
+    return 500
+}
+```
+**Why used:** self-throttling pacing model — avoids naive fixed delay when server is already under stress.
+
+---
+
+## 3. Add → Pre Processors → JSR223 PreProcessor
+**Use case:** Generate a signed request header (HMAC) before an OCS charging call.
+
+```groovy
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+def apiKey = vars.get("apiKey")
+def secret = vars.get("apiSecret")
+def timestamp = System.currentTimeMillis().toString()
+def payload = apiKey + timestamp
+
+Mac mac = Mac.getInstance("HmacSHA256")
+mac.init(new SecretKeySpec(secret.getBytes(), "HmacSHA256"))
+def signature = mac.doFinal(payload.getBytes()).encodeBase64().toString()
+
+vars.put("reqTimestamp", timestamp)
+vars.put("reqSignature", signature)
+```
+**Why used:** anything that must be freshly computed right before the sampler fires — signatures, timestamps, encrypted fields.
+
+---
+
+## 4. Add → Post Processors → JSR223 PostProcessor
+**Use case:** Extract order status from JSON response and calculate custom settlement latency metric.
+
+```groovy
+import groovy.json.JsonSlurper
+
+def response = new JsonSlurper().parseText(prev.getResponseDataAsString())
+vars.put("orderStatus", response.status ?: "UNKNOWN")
+
+def kafkaEventTime = vars.get("kafkaEventTimestamp")
+if (kafkaEventTime != null) {
+    def latency = System.currentTimeMillis() - kafkaEventTime.toLong()
+    vars.put("settlementLatencyMs", latency.toString())
+    log.info("Order ${vars.get('orderId')} settlement latency: ${latency}ms")
+}
+```
+**Why used:** whenever extraction needs logic beyond a simple path match — calculations, conditional storage, cross-referencing an earlier variable.
+
+---
+
+## 5. Add → Assertions → JSR223 Assertion
+**Use case:** Validate billing amount from API matches DB-extracted expected value.
+
+```groovy
+def expectedAmount = vars.get("expectedBillAmount").toDouble()
+def actualAmount = vars.get("actualBillAmount").toDouble()
+def tolerance = 0.01
+
+if (Math.abs(expectedAmount - actualAmount) > tolerance) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("Billing mismatch — expected: ${expectedAmount}, actual: ${actualAmount}")
+}
+```
+**Why used:** business-rule validation that's too complex for Response/JSON Assertion — cross-field or cross-source checks.
+
+---
+
+## 6. Add → Listener → JSR223 Listener
+**Use case:** Push a custom summary metric to an external file/monitoring endpoint as results stream in, instead of relying only on the .jtl file.
+
+```groovy
+// Runs once per sample result as it's collected
+if (sampleEvent != null) {
+    def result = sampleEvent.getResult()
+    def label = result.getSampleLabel()
+    def responseTime = result.getTime()
+    def success = result.isSuccessful()
+
+    if (!success) {
+        def logLine = "${new Date()} | FAILED | ${label} | ${responseTime}ms | ${result.getResponseCode()}\n"
+        new File("/tmp/jmeter_failures.log").append(logLine)
+    }
+}
+```
+**Why used:** rare, but useful for lightweight custom logging/alerting hooks alongside standard Listeners — e.g., writing only failures to a separate file for quick triage during a long soak test.
+
+---
+
+## Quick reference table
+
+| Menu location | Element | Typical telecom use |
+|---|---|---|
+| Sampler | JSR223 Sampler | Custom synthetic transaction |
+| Timer | JSR223 Timer | Adaptive pacing |
+| Pre Processors | JSR223 PreProcessor | HMAC signature, dynamic headers |
+| Post Processors | JSR223 PostProcessor | Custom extraction + latency calc |
+| Assertions | JSR223 Assertion | Cross-field business validation (billing) |
+| Listener | JSR223 Listener | Custom failure logging/alerting |
+
+**Note on Config Elements:** there's no JSR223 Config Element in JMeter's menu — if you need scripted config-like setup (e.g., computing a value once before the whole test), that's typically done via **JSR223 PreProcessor at Thread Group level** combined with **Once Only Controller**, or via **setUp Thread Group** with a JSR223 Sampler inside it.
+
+Want a **combined script walkthrough** next — one full script trace showing a single request moving through PreProcessor → Sampler → PostProcessor → Assertion, so you can explain the complete lifecycle end-to-end in an interview?
