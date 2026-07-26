@@ -1,0 +1,53 @@
+Built-in Thread Groups
+
+**1. Thread Group (standard)**
+- Basic: threads, ramp-up, loop count (or infinite), optional scheduler (duration/startup delay)
+- Use: simple load profiles, baseline/smoke tests, anything where you just need N users hitting a flow M times
+
+**2. setUp Thread Group**
+- Runs before all regular thread groups start, regardless of position in the plan
+- Use: pre-test setup — auth token generation, test data seeding, cache warm-up, environment health check
+
+**3. tearDown Thread Group**
+- Runs after all regular thread groups finish
+- Use: cleanup — deleting test data, closing sessions, releasing reserved resources
+
+Standard TG's weakness: you can't do non-linear ramp-up, can't hold steady state cleanly with fine control, and can't easily do spike/step patterns without workarounds (Synchronizing Timer, JSR223 hacks). That's where jpgc plugins come in.
+
+## jmeter-plugins (jpgc) Thread Groups — via Custom Thread Groups plugin
+
+**4. Stepping Thread Group**
+- Adds users in steps (e.g., 10 users every 30s until 100), holds, then steps down
+- Use: gradual ramp-up load tests, finding the breakpoint where response times degrade — most commonly used jpgc TG for realistic capacity testing
+
+**5. Ultimate Thread Group**
+- Fully custom load shape via a table: (start threads, initial delay, startup time, hold time, shutdown time) rows, chainable
+- Use: complex, arbitrary load curves — spike tests, sawtooth patterns, business-hour traffic simulation. Most flexible option; often paired with the jpgc graph to visualize the shape before running
+
+**6. Arrivals Thread Group**
+- Defines load by arrival rate (requests/sec you want arriving) rather than thread count — engine calculates threads needed dynamically
+- Use: modeling systems where throughput/arrival rate is the real-world spec (e.g., "we get 500 orders/min"), rather than guessing at user counts. Closer to open-model load testing (like Gatling's default) vs JMeter's default closed model
+
+**7. Free-Form Arrivals Thread Group**
+- Same arrival-rate concept as above but with a free-form table for irregular arrival patterns over time
+- Use: traffic replaying real production arrival patterns that don't fit a clean ramp/step shape
+
+**8. Concurrency Thread Group**
+- Maintains a target concurrent thread count using a specified ramp-up strategy, and importantly, works with **Throughput Shaping Timer** to hold precise throughput rather than just thread count
+- Use: paired almost always with bzm's Throughput Shaping Timer (different plugin, "Throughput Shaping Timer" under jpgc) when the actual goal is "sustain X req/s" rather than "sustain X users" — very common in your kind of telecom OSS/BSS load profiling where SLAs are throughput-based, not user-count-based
+
+## Practical mapping for performance test design
+
+| Goal | Thread Group to use |
+|---|---|
+| Simple functional/load smoke | Standard Thread Group |
+| Token/session prep before load | setUp Thread Group |
+| Post-test data cleanup | tearDown Thread Group |
+| Find breaking point / soak with steps | Stepping Thread Group |
+| Arbitrary custom load shape / spike test | Ultimate Thread Group |
+| Model by arrival rate (open system) | Arrivals / Free-Form Arrivals TG |
+| Hold precise TPS/throughput target | Concurrency TG + Throughput Shaping Timer |
+
+One thing worth flagging since you work with distributed JMeter: Ultimate and Stepping Thread Groups don't distribute cleanly across remote injectors by default the way standard TG does — you need to account for per-injector thread math manually, since each injector runs the full shape independently unless you divide counts yourself.
+
+Want me to go deeper on any one of these — e.g. how Concurrency TG + Throughput Shaping Timer is configured together, since that's the one most relevant to SLA-driven telecom load profiles?
