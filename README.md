@@ -590,4 +590,262 @@ For your OSS/BSS + REST/JSON work, the ones you'll use constantly are: **Respons
 
 
 
+Here's the notebook-style breakdown for Pre-Processors.
 
+## What is a Pre-Processor?
+A Pre-Processor runs code/logic **before** a sampler fires — it modifies or prepares something (a variable, a request field, the sampler itself) right before the request goes out. Think of it as "setup work done just-in-time, per request" — different from Config Elements which set values once at a higher scope.
+
+---
+
+## BUILT-IN PRE-PROCESSORS
+
+**HTTP specific**
+- **HTTP URL Re-writing Modifier** — rewrites URLs to carry session ID in the URL path instead of cookies → used for legacy apps that do URL-based session tracking instead of cookie-based (rare today, but some old telecom portals still do this)
+
+**Parameter/data manipulation**
+- **User Parameters** — sets per-thread variable values (different value per simulated user) right before the sampler → used to assign each thread its own set of values inline in the tree, alternative to CSV Data Set Config for small fixed data sets
+
+**Sampler modification**
+- **HTML Link Parser** — automatically parses HTML response and modifies next request's URL if needed → older technique from pre-correlation-extractor days, rarely used now (Extractors do this job better)
+
+**Scripting**
+- **JSR223 PreProcessor** — write custom Groovy/Java logic before the sampler runs → this is the big one you'll actually use — dynamic header generation, custom auth signature calculation, request body manipulation, timestamp injection, encryption/hashing before sending
+- **BeanShell PreProcessor** — older scripting version, avoid, use JSR223 instead
+
+**Sample timing**
+- **RegEx User Parameters** — applies regex-extracted values as parameters before the sampler → niche, mostly superseded by Regular Expression Extractor + variable reference
+
+---
+
+## PLUGIN PRE-PROCESSORS
+
+Pre-Processors, like Assertions, are mostly a core-JMeter category — jpgc doesn't add many here. The most notable third-party additions:
+
+- **Custom JSR223 snippets from community libraries** — not really separate elements, just shared Groovy scripts people reuse inside the built-in JSR223 PreProcessor (e.g., HMAC signature generation scripts for API security testing)
+
+There's no major dedicated "plugin pre-processor" ecosystem the way there is for Thread Groups/Listeners — this category is deliberately kept simple in core JMeter, and JSR223 covers basically anything custom you'd need.
+
+---
+
+## SIMPLE TABLE FOR YOUR NOTEBOOK
+
+| Pre-Processor | Purpose | When to use |
+|---|---|---|
+| HTTP URL Re-writing Modifier | URL-based session tracking | Legacy apps without cookie sessions |
+| User Parameters | Per-thread inline variable values | Small fixed data sets, alt to CSV |
+| HTML Link Parser | Auto-parse HTML for next URL | Rare, mostly replaced by Extractors |
+| JSR223 PreProcessor | Custom scripted logic before request | Dynamic headers, signatures, timestamps, encryption |
+| RegEx User Parameters | Regex-based param injection | Niche, mostly replaced by Extractor + variable |
+
+---
+
+## Practical example most relevant to you
+
+Given your OSS/BSS + API work, the classic real-world use of **JSR223 PreProcessor** is generating a request signature or timestamp header that the API requires fresh on every call:
+
+```groovy
+// Add current timestamp + a calculated signature header before each request
+def timestamp = System.currentTimeMillis().toString()
+vars.put("reqTimestamp", timestamp)
+
+def rawString = vars.get("apiKey") + timestamp
+def signature = rawString.digest("SHA-256")  // simplified example
+vars.put("reqSignature", signature)
+```
+Then in the HTTP Header Manager, you'd reference `${reqTimestamp}` and `${reqSignature}` — values are freshly generated per-request instead of static.
+
+**Scope rule** (same pattern as Timers/Assertions): a Pre-Processor placed inside a sampler runs only before that sampler; placed at Thread Group level, it runs before every sampler in that group.
+
+Want **Post-Processors/Extractors** next — that's the natural next step since PreProcessor sets things up, but Extractors are what actually pull dynamic values (tokens, IDs) out of responses to use later?It looks like your message came through empty — no worries, I'll continue with what we lined up: **Post-Processors/Extractors**, since that's the natural next step after Pre-Processors.
+
+## What is a Post-Processor?
+A Post-Processor runs **after** a sampler gets its response — it pulls (extracts) a value out of that response so you can reuse it in later requests. This is the backbone of **correlation** — without it, dynamic values like session tokens, order IDs, or auth codes stay hardcoded and your script breaks the moment the server generates a new value.
+
+---
+
+## BUILT-IN POST-PROCESSORS (Extractors)
+
+**Text/Regex based**
+- **Regular Expression Extractor** — pulls a value out of response body/headers using regex → the classic, most-used extractor, works on any response format (HTML, JSON, XML, plain text)
+
+**Structured data**
+- **JSON Extractor** — pulls a value using JSONPath syntax (`$.data.orderId`) → cleaner and safer than regex for JSON APIs, your go-to for REST responses
+- **JSON JMESPath Extractor** — same idea, more powerful JMESPath query syntax for complex nested/filtered JSON extraction
+- **XPath Extractor / XPath2 Extractor** — pulls a value from XML using XPath → used for SOAP/XML legacy telecom responses
+- **CSS/JQuery Extractor** — pulls a value using CSS selector syntax → used for HTML page scraping-style extraction (less common in API testing, more for web-page-heavy apps)
+
+**Simple substring**
+- **Boundary Extractor** — pulls value between a "left boundary" and "right boundary" string → simpler and faster than regex when the value has clear fixed text around it (e.g., between `"token":"` and `"`)
+
+**Result-level**
+- **Result Status Action Handler** — not really an extractor, technically listed here — controls what happens (stop thread/test) based on sample result → edge case usage
+
+**Scripting**
+- **JSR223 PostProcessor** — custom Groovy/Java logic after the response → used when extraction logic is too complex for standard extractors (parsing + transforming + conditional logic together), or when you need to do something with the response besides just extracting (e.g., decode base64, compute a hash, write to external file)
+- **BeanShell PostProcessor** — older version, avoid, use JSR223 instead
+
+---
+
+## PLUGIN POST-PROCESSORS
+
+Same pattern as Assertions/Pre-Processors — this is a core JMeter category, jpgc doesn't add dedicated new ones. JSR223 PostProcessor covers custom needs.
+
+---
+
+## SIMPLE TABLE FOR YOUR NOTEBOOK
+
+| Post-Processor | Extracts from | When to use |
+|---|---|---|
+| Regular Expression Extractor | Any text (HTML/JSON/XML/plain) | Universal — most flexible, most used |
+| JSON Extractor | JSON (JSONPath) | Clean REST API extraction |
+| JSON JMESPath Extractor | JSON (JMESPath) | Complex/nested JSON queries |
+| XPath / XPath2 Extractor | XML (XPath) | SOAP/XML legacy systems |
+| CSS/JQuery Extractor | HTML (CSS selector) | Web page scraping style |
+| Boundary Extractor | Text between two markers | Fast, simple extraction |
+| JSR223 PostProcessor | Custom scripted logic | Complex parsing/transformation |
+
+---
+
+## Practical correlation example (session token)
+
+**Regular Expression Extractor config:**
+- Apply to: Main sample
+- Field to check: Body
+- Reference Name: `sessionToken`
+- Regular Expression: `"token":"(.*?)"`
+- Template: `$1$`
+- Match No.: `1`
+
+Then in your next HTTP Request's header or body, reference it as `${sessionToken}`.
+
+**Same thing with JSON Extractor (cleaner for JSON APIs):**
+- Names of created variables: `sessionToken`
+- JSON Path expressions: `$.token`
+- Match No.: `1`
+
+**Scope rule** (same as always): a Post-Processor placed inside a sampler extracts only from that sampler's response; at Thread Group level it'd apply to every sampler — but in practice, extractors are almost always placed *inside* the specific sampler whose response holds the value you need.
+
+For your OSS/BSS work, **Regular Expression Extractor + JSON Extractor** will cover nearly everything — regex when the API returns plain text/HTML fragments, JSON Extractor when it's clean REST JSON. Use **JSR223 PostProcessor** only when you need to do more than just pull a value (e.g., decode/transform it before storing).
+
+Got it — here's the clean notebook version for Post-Processors (Extractors).
+
+## What is a Post-Processor?
+Runs **after** a sampler gets its response, and pulls a value out of it to reuse later. This is the core mechanism for **correlation** — capturing dynamic values like session tokens, order IDs, OTPs so your script doesn't break when the server generates fresh values each run.
+
+---
+
+## BUILT-IN POST-PROCESSORS
+
+| Post-Processor | Extracts from | When to use |
+|---|---|---|
+| **Regular Expression Extractor** | Any text (HTML/JSON/XML/plain) | Universal — most used, works everywhere |
+| **JSON Extractor** | JSON (JSONPath syntax) | Clean, safe REST API field extraction |
+| **JSON JMESPath Extractor** | JSON (JMESPath syntax) | Complex/nested/filtered JSON queries |
+| **XPath Extractor / XPath2 Extractor** | XML (XPath syntax) | SOAP/XML legacy telecom responses |
+| **CSS/JQuery Extractor** | HTML (CSS selector) | Web page scraping, less common in API testing |
+| **Boundary Extractor** | Text between two fixed markers | Fast/simple when value has clear surrounding text |
+| **JSR223 PostProcessor** | Custom scripted logic | Complex parsing, decoding, hashing, conditional logic |
+| **BeanShell PostProcessor** | Same as JSR223, older | Avoid — legacy, slower |
+
+---
+
+## PLUGIN POST-PROCESSORS
+No major jpgc additions here — this stays a core JMeter category. JSR223 PostProcessor covers any custom need instead.
+
+---
+
+## Practical example (session token correlation)
+
+**Using Regular Expression Extractor:**
+- Field to check: `Body`
+- Reference Name: `sessionToken`
+- Regex: `"token":"(.*?)"`
+- Template: `$1$`
+- Match No.: `1`
+
+**Using JSON Extractor (cleaner for JSON APIs):**
+- Names of created variables: `sessionToken`
+- JSON Path expressions: `$.token`
+- Match No.: `1`
+
+Then reuse it anywhere downstream as `${sessionToken}`.
+
+---
+
+**Scope rule** (same pattern as Timers/Assertions/Pre-Processors): place the extractor **inside** the specific sampler whose response holds the value — that's standard practice, rather than at Thread Group level.
+
+For your OSS/BSS work: **Regular Expression Extractor** for messy/plain-text responses, **JSON Extractor** for clean REST JSON — those two will cover almost everything you script.
+Here's the notebook-style breakdown for Logic Controllers.
+
+## What is a Logic Controller?
+A Logic Controller doesn't send requests itself — it controls the **order, flow, and conditions** under which samplers inside it execute. Think of it as the "if/loop/grouping" logic layer of your test script.
+
+---
+
+## BUILT-IN LOGIC CONTROLLERS
+
+**Grouping/organization**
+- **Transaction Controller** — groups multiple samplers into one logical "transaction" and reports combined response time as one → your most-used controller for reporting, e.g., wrap "Login" (which might be 3 HTTP calls) into one Transaction Controller so reports show "Login: 1.2s" instead of 3 separate lines
+- **Simple Controller** — just a folder/grouping with no logic, purely organizational → used to visually organize a script (e.g., "Login Flow," "Order Flow") without affecting execution
+
+**Conditional**
+- **If Controller** — runs child elements only if a condition (JS/variable expression) is true → used for conditional flows, e.g., only hit "Retry" sampler if previous response failed
+- **Switch Controller** — runs one specific child branch based on a variable's value (like a switch/case) → used when you have multiple distinct paths based on a category variable (e.g., different flows per subscriber type: prepaid/postpaid/enterprise)
+
+**Looping**
+- **Loop Controller** — repeats child elements a fixed number of times → used for repeating a specific step block inside one iteration
+- **While Controller** — repeats child elements while a condition remains true → used when repeat count isn't fixed, depends on a runtime condition (e.g., keep polling order status until it's "COMPLETED")
+- **ForEach Controller** — loops through a set of variables (usually from an Extractor that captured multiple matches) → used when a previous response returned a list, and you need to run a sampler once per item (e.g., loop through all returned order IDs and fetch each one's detail)
+
+**Randomization/distribution**
+- **Random Controller** — picks one child element at random to execute (not all) → used to simulate varied user behavior — different users take different random paths
+- **Random Order Controller** — runs all children but in random order → used when all steps must run but order shouldn't always be identical, more realistic simulation
+- **Throughput Controller** — controls what % of iterations, or a fixed number of times, its children run → used to simulate percentage-based behavior splits, e.g., "30% of users go through Express Checkout, 70% go through Standard Checkout"
+
+**Recording**
+- **Recording Controller** — target container for the HTTP(S) Test Script Recorder (already covered earlier) → just a landing zone, no logic itself
+
+**Reliability/error handling**
+- **Include Controller** — pulls in and runs an entire external `.jmx` test fragment file → used to reuse common flows (like login) across multiple test plans without copy-pasting
+- **Module Controller** — runs a Test Fragment defined elsewhere in the *same* test plan → used to reuse a block within one script without duplicating it, keeps script DRY
+- **Test Fragment** — not a controller exactly, but the element type Module Controller and Include Controller reference → holds a reusable chunk of test logic, disconnected from the main execution flow unless called
+
+**Interleaving**
+- **Interleave Controller** — alternates execution between its children, one per loop iteration (round-robin) → used to alternate between two flows, e.g., iteration 1 hits Server A path, iteration 2 hits Server B path, etc.
+
+**Once-only**
+- **Once Only Controller** — runs child elements only on the first iteration of a loop, skips on subsequent ones → used for one-time setup within a thread's lifecycle, e.g., login once, then repeat only the "browse" steps for remaining iterations
+
+**Critical Section**
+- **Critical Section Controller** — ensures child elements run one thread at a time (mutex-style lock) → used for testing scenarios requiring serialized access, e.g., validating unique-sequence-number generation isn't broken under concurrency
+
+---
+
+## PLUGIN LOGIC CONTROLLERS
+
+Logic Controllers are also a stable core category — jpgc doesn't significantly extend this. It's considered "complete" in core JMeter for flow-control needs; anything more custom is typically handled via JSR223 Sampler/PreProcessor logic instead.
+
+---
+
+## SIMPLE TABLE FOR YOUR NOTEBOOK
+
+| Controller | Behavior | When to use |
+|---|---|---|
+| Transaction Controller | Groups samplers, reports combined time | Business-step-level reporting (most used) |
+| Simple Controller | Pure grouping, no logic | Script organization only |
+| If Controller | Conditional execution | Run steps only if condition true |
+| Switch Controller | Branch by variable value | Multi-path flows (subscriber type, etc.) |
+| Loop Controller | Fixed repeat count | Repeat a step block N times |
+| While Controller | Repeat while condition true | Poll until status changes |
+| ForEach Controller | Loop through extracted variable list | Process each item from a prior multi-match extract |
+| Random Controller | Runs one random child | Simulate varied user paths |
+| Random Order Controller | Runs all children, random order | Realistic non-sequential behavior |
+| Throughput Controller | % or fixed-count execution | Percentage-split user behavior |
+| Recording Controller | Landing zone for recorder | Script recording only |
+| Include Controller | Runs external .jmx fragment | Reuse flow across separate test plans |
+| Module Controller | Runs fragment within same plan | Reuse flow within one script |
+| Interleave Controller | Alternates children per iteration | Round-robin between paths |
+| Once Only Controller | Runs children on first iteration only | One-time setup (e.g., login once) |
+| Critical Section Controller | Serializes access (mutex) | Concurrency-sensitive validation |
+
+For your OSS/BSS work, the ones you'll use constantly are: **Transaction Controller** (reporting), **If Controller** (conditional retry/error handling), **ForEach Controller** (processing lists like multiple orders/subscribers), and **Once Only Controller** (login-once-per-thread pattern). **Throughput Controller** is also valuable for modeling realistic traffic splits across different customer journeys (prepaid vs postpaid vs enterprise provisioning, for example).
