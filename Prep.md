@@ -5,7 +5,7 @@
 
 ## 1. Self-Introduction (30–45 sec, then expand if asked)
 
-> "I'm Vijay, a Performance Test Lead with 10+ years in QA, 8+ years focused specifically on Performance Engineering. Most recently I was with TCS, engaged on the CelcomDigi account in Malaysia — a telecom OSS/BSS environment covering order management, provisioning, and billing for a large subscriber base.
+> "I'm Vijay, a Performance Test Lead with 10+ years in QA, 8+ years focused specifically on Performance Engineering. 
 
 > My core stack is LoadRunner (VuGen, Controller, Analysis — HTTP, Web Services, Java, Citrix, MQ, Oracle protocols) and JMeter for distributed load testing, paired with Dynatrace and Datadog for APM, and ELK/Kibana for log correlation. I've also worked extensively with Kafka on the production side — queue performance, consumer lag, offset management — since a lot of our provisioning workflows were event-driven.
 
