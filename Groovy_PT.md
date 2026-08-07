@@ -337,11 +337,335 @@ def customerName = json?.customer?.name ?: "UNKNOWN"
 **Interview point:** The `?.` (safe navigation) and `?:` (Elvis operator) combo is a Groovy-specific defensive-coding idiom worth demonstrating — avoids verbose null-checking chains.
 
 ---
+----------------------------------------------------------------------------------------
 
-# INTERVIEW-READY SUMMARY STATEMENT
+# JSR223 Groovy — JMeter Scripting Reference
+## Correlation | Parameterization | Multi-Order Responses | Data Extraction
 
-*"I use Groovy in JMeter primarily for three things: dynamic payload construction with proper JSON serialization instead of string concatenation, correlation and cross-thread state management using thread-safe collections in `props`, and custom business-logic assertions that go beyond simple status-code checks — like cross-referencing API responses against database state. I'm also conscious that scripting itself has a performance cost on the load generator, so I default to native JMeter elements first and reserve JSR223 for logic that genuinely needs it, keeping script caching enabled and avoiding heavy computation in hot-path scripts."*
+---
 
-That one paragraph, backed by 2-3 of the examples above, is usually enough to establish strong Groovy/JMeter credibility in a senior interview without over-explaining.
+## 1. Correlation
 
-Want a **hands-on practice set** next — 5-10 short Groovy exercises with solutions (not JMeter-specific, just pure Groovy fundamentals) to sharpen syntax fluency before the interview?
+Correlation = pulling a dynamic value out of one response and injecting it into the next request (orderId, token, sessionId, txnRef).
+
+### 1.1 JSON correlation with JsonSlurper (preferred over regex for JSON)
+
+```groovy
+// JSR223 PostProcessor — attached to "Create Order" sampler
+import groovy.json.JsonSlurper
+
+def response = prev.getResponseDataAsString()
+def json = new JsonSlurper().parseText(response)
+
+def orderId = json.orderId
+def txnRef  = json.transaction.referenceNumber
+
+vars.put("orderId", orderId)
+vars.put("txnRef", txnRef)
+
+log.info("Correlated orderId=" + orderId + " txnRef=" + txnRef)
+```
+
+Use `${orderId}` in the next sampler's body/path.
+
+### 1.2 Regex-based correlation (when response isn't clean JSON — HTML, mixed logs)
+
+```groovy
+def response = prev.getResponseDataAsString()
+def matcher = response =~ /"sessionToken"\s*:\s*"([a-zA-Z0-9\-]+)"/
+
+if (matcher.find()) {
+    vars.put("sessionToken", matcher.group(1))
+} else {
+    log.error("sessionToken not found in response")
+    vars.put("sessionToken", "NOT_FOUND")
+}
+```
+
+### 1.3 Header correlation (auth token, correlation-id from response headers)
+
+```groovy
+def headers = prev.getResponseHeaders()
+def matcher = headers =~ /X-Correlation-Id:\s*(\S+)/
+if (matcher.find()) {
+    vars.put("correlationId", matcher.group(1).trim())
+}
+```
+
+### 1.4 Correlation with fallback / retry-safe defaults
+
+```groovy
+// Avoids polluting vars with null when an intermittent 4xx/5xx happens
+import groovy.json.JsonSlurper
+
+if (prev.getResponseCode() == "200") {
+    def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+    vars.put("provisioningId", json?.provisioningId ?: "MISSING")
+} else {
+    log.warn("Non-200 on provisioning call: " + prev.getResponseCode())
+    vars.put("provisioningId", "MISSING")
+}
+```
+
+---
+
+## 2. Parameterization
+
+Beyond CSV Data Set Config — dynamic, computed, or randomized parameterization in Groovy.
+
+### 2.1 Random test data generation (JSR223 PreProcessor)
+
+```groovy
+import java.util.UUID
+
+// Unique MSISDN-style subscriber number per thread iteration
+def msisdn = "601" + (10000000 + new Random().nextInt(89999999))
+vars.put("msisdn", msisdn)
+
+// Unique idempotency/transaction key
+vars.put("txnId", UUID.randomUUID().toString())
+
+// Random order type from a fixed set — simulates realistic order mix
+def orderTypes = ["NEW_CONNECTION", "PORT_IN", "PLAN_CHANGE", "RECONTRACT"]
+vars.put("orderType", orderTypes[new Random().nextInt(orderTypes.size())])
+```
+
+### 2.2 Weighted parameterization (realistic traffic mix, e.g. 70% GET / 30% POST style ratios)
+
+```groovy
+def rand = new Random().nextInt(100)
+def orderType
+if (rand < 70) {
+    orderType = "PLAN_CHANGE"       // 70%
+} else if (rand < 90) {
+    orderType = "NEW_CONNECTION"    // 20%
+} else {
+    orderType = "PORT_IN"           // 10%
+}
+vars.put("orderType", orderType)
+```
+
+### 2.3 Reading and cycling through a CSV inside Groovy (when CSV Data Set Config's thread-sharing doesn't fit)
+
+```groovy
+import java.nio.file.Files
+import java.nio.file.Paths
+
+// Load once per thread group start, cache in props (shared across threads)
+if (props.get("customerData") == null) {
+    def lines = Files.readAllLines(Paths.get("/opt/jmeter/data/customers.csv"))
+    props.put("customerData", lines)
+}
+
+def data = props.get("customerData")
+def row = data[ctx.getThreadNum() % data.size()]
+def cols = row.split(",")
+vars.put("customerId", cols[0])
+vars.put("planCode", cols[1])
+```
+
+### 2.4 Date/time parameterization (order effective dates, TTL windows)
+
+```groovy
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+def now = LocalDateTime.now()
+def effectiveDate = now.plusDays(1)
+def fmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss")
+
+vars.put("orderTimestamp", now.format(fmt))
+vars.put("effectiveDate", effectiveDate.format(fmt))
+```
+
+---
+
+## 3. Handling Multiple Order Responses (arrays / batch order journeys)
+
+Common in OSS/BSS: a single API call returns an array of orders, or you fan out N sub-orders and need to track each independently.
+
+### 3.1 Parsing a JSON array of orders and looping
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+def orders = json.orders   // assume: { "orders": [ {...}, {...} ] }
+
+log.info("Total orders returned: " + orders.size())
+
+orders.eachWithIndex { order, idx ->
+    vars.put("order_${idx}_id", order.orderId)
+    vars.put("order_${idx}_status", order.status)
+    vars.put("order_${idx}_type", order.orderType)
+}
+
+vars.put("orderCount", orders.size().toString())
+```
+
+Downstream, a **ForEach Controller** or a **While Controller** driven by `orderCount` iterates `order_0_id`, `order_1_id`, etc.
+
+### 3.2 Filtering multi-order response for specific status before proceeding (gate pattern)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+def pendingOrders = json.orders.findAll { it.status == "PENDING_PROVISIONING" }
+
+if (pendingOrders.isEmpty()) {
+    log.warn("No pending orders — skipping provisioning check")
+    vars.put("skipProvisioning", "true")
+} else {
+    vars.put("skipProvisioning", "false")
+    vars.put("pendingCount", pendingOrders.size().toString())
+    // stash the first pending order's ID for the next sampler
+    vars.put("firstPendingOrderId", pendingOrders[0].orderId)
+}
+```
+Pair with an **If Controller**: `${skipProvisioning} == "false"`.
+
+### 3.3 Aggregating results across a batch (building a JSON array to POST as a bulk request)
+
+```groovy
+import groovy.json.JsonBuilder
+
+def orderIds = (1..5).collect { vars.get("order_${it}_id") }.findAll { it != null }
+
+def payload = new JsonBuilder()
+payload {
+    batchId vars.get("txnId")
+    orderReferences orderIds
+}
+vars.put("bulkOrderPayload", payload.toString())
+```
+Use `${bulkOrderPayload}` as the raw body of a bulk-status sampler.
+
+### 3.4 Correlating N sub-orders from a split/fan-out response (e.g. bundle order → device + SIM + plan sub-orders)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+
+json.subOrders.each { sub ->
+    switch (sub.componentType) {
+        case "DEVICE":
+            vars.put("deviceOrderId", sub.orderId)
+            break
+        case "SIM":
+            vars.put("simOrderId", sub.orderId)
+            break
+        case "PLAN":
+            vars.put("planOrderId", sub.orderId)
+            break
+    }
+}
+```
+
+---
+
+## 4. Data-Related Response Processing
+
+### 4.1 Nested field extraction with null-safe navigation
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+
+// Safe navigation (?.) avoids NPE if a nested key is missing/optional
+def billingCycle = json?.subscriber?.billing?.cycleType ?: "UNKNOWN"
+def deviceImei    = json?.order?.device?.imei ?: "N/A"
+
+vars.put("billingCycle", billingCycle)
+vars.put("deviceImei", deviceImei)
+```
+
+### 4.2 Response validation as a scripted Assertion (JSR223 Assertion)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+
+if (json.status != "SUCCESS") {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("Order failed. Status: " + json.status +
+        " | Reason: " + (json.failureReason ?: "not provided"))
+}
+
+if (json.orderId == null || json.orderId.toString().trim().isEmpty()) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("orderId missing in response")
+}
+```
+Note: in a JSR223 Assertion, `AssertionResult` is injected automatically — don't redeclare it.
+
+### 4.3 Comparing response field against expected reference data (data-driven verification)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+def expectedPlan = vars.get("planCode")   // came from CSV/parameterization
+def actualPlan = json.subscriber.planCode
+
+if (actualPlan != expectedPlan) {
+    log.error("Plan mismatch. Expected=" + expectedPlan + " Actual=" + actualPlan)
+    vars.put("planMismatchFlag", "true")
+} else {
+    vars.put("planMismatchFlag", "false")
+}
+```
+
+### 4.4 Extracting and summing numeric fields across an array (e.g. total charges across order lines)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+def totalCharge = json.orderLines.sum { it.charge as BigDecimal }
+
+vars.put("totalCharge", totalCharge.toString())
+log.info("Computed total charge across ${json.orderLines.size()} lines: " + totalCharge)
+```
+
+### 4.5 Response time / SLA check scripted inline (custom pass/fail beyond Duration Assertion)
+
+```groovy
+def elapsed = prev.getTime()
+def slaThresholdMs = 3000
+
+if (elapsed > slaThresholdMs) {
+    prev.setSuccessful(false)
+    prev.setResponseMessage("SLA breach: ${elapsed}ms > ${slaThresholdMs}ms threshold")
+}
+```
+
+### 4.6 Writing extracted data to an external file (for offline analysis / audit trail)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+def line = "${System.currentTimeMillis()},${json.orderId},${json.status},${prev.getTime()}\n"
+
+new File("/opt/jmeter/results/order_audit.csv").append(line)
+```
+Caution: file I/O from every thread adds contention at high concurrency — prefer buffering or Backend Listener (InfluxDB) for real load tests; use this pattern mainly in low-thread diagnostic runs.
+
+---
+
+## Quick Reference — Object Cheat Sheet
+
+| Object | Scope | Common use |
+|---|---|---|
+| `vars` | Thread-local | get/put correlated values, parameterized data |
+| `props` | JVM-global (shared across threads) | shared static data, counters, cached CSV loads |
+| `prev` | Current sampler result | `getResponseDataAsString()`, `getResponseCode()`, `getTime()`, `setSuccessful()` |
+| `ctx` | Thread context | `getThreadNum()`, `getVariables()` |
+| `log` | Jmeter logger | `log.info/warn/error` — goes to jmeter.log |
+| `AssertionResult` | JSR223 Assertion only | `setFailure()`, `setFailureMessage()` |
+
+**Performance tip:** always favor `JsonSlurper`/`JsonBuilder` over manual regex for JSON — it's both cleaner and avoids catastrophic backtracking regex can hit on large payloads. Cache compiled scripts (Script Compilation Cache: enable "Cache compiled script if available" checkbox in JSR223 elements) to avoid re-parsing Groovy on every iteration at scale.
