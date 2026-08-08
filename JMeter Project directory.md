@@ -246,7 +246,7 @@ Here are concrete config examples for each — values you can literally set in t
 | Free-Form Arrivals | Irregular rate table | Replaying real, non-linear production traffic curves |
 | Concurrency + Throughput Shaping Timer | Precise TPS over time | SLA-driven exact throughput targets (charging, billing) |
 
-For your CelcomDigi-style work, **Concurrency TG + Throughput Shaping Timer** is the one you'll want to be able to configure live/whiteboard in an interview — it's the most commonly asked "design a busy-hour load test" scenario at senior level.
+For your ExperienceCompany-style work, **Concurrency TG + Throughput Shaping Timer** is the one you'll want to be able to configure live/whiteboard in an interview — it's the most commonly asked "design a busy-hour load test" scenario at senior level.
 **Advanced concept — Closed vs Open system models:**
 - Standard/Concurrency TG = **closed model** (fixed thread pool, new request only after previous completes — thread "waits")
 - Arrivals TG = **open model** (new virtual users arrive at a rate regardless of whether previous ones finished — mimics real internet traffic better)
@@ -575,7 +575,7 @@ query { subscriber(msisdn: "${msisdn}") { plan { name, dataBalance } } }
 | WebSocket Sampler | WebSocket | Live order-status push |
 | GraphQL Sampler | GraphQL | Modern subscriber data API |
 
-Given your CelcomDigi background, **HTTP Request, JDBC Request, Kafka Sampler, and JSR223 Sampler** remain your highest-frequency samplers — the rest (TCP, LDAP, FTP, JMS/AMQP) are the "I know these exist and when to reach for them" tier that's still worth being able to speak to fluently if probed.
+Given your ExperienceCompany background, **HTTP Request, JDBC Request, Kafka Sampler, and JSR223 Sampler** remain your highest-frequency samplers — the rest (TCP, LDAP, FTP, JMS/AMQP) are the "I know these exist and when to reach for them" tier that's still worth being able to speak to fluently if probed.
 ---
 
 ## 5. CONFIG ELEMENTS — MERGE HIERARCHY
