@@ -144,7 +144,109 @@ Thread Group Types:
     ├── Free-Form Arrivals TG      → irregular arrival pattern
     └── Concurrency Thread Group   → target concurrency + Throughput Shaping Timer pairing
 ```
+Here are concrete config examples for each — values you can literally set in the GUI, plus a telco use case for each.
 
+---
+
+## 1. Stepping Thread Group
+
+**Config:**
+- This Group Will Start = `100` threads
+- First, Wait for = `10` sec
+- Then Start = `10` threads every `30` sec
+- Startup time = `10` sec (time to start each step's batch)
+- Hold load for = `120` sec (steady time before next step)
+- Then Stop = `10` threads every `20` sec
+- Thread Lifetime — Startup, then hold `600` sec total, Shutdown `10` threads every `20` sec
+
+**Meaning:** Starts small, adds 10 users every 30 seconds until reaching 100, holds, then winds down the same way.
+
+**Telco use case:** Finding the breaking point of the **Order Provisioning API** — start at 10 concurrent orders, step up by 10 every 30s, watch response times/error rate at each step until SLA breaches (e.g., response time crosses 2s) → gives you the exact capacity ceiling before go-live.
+
+---
+
+## 2. Ultimate Thread Group
+
+**Config (table rows):**
+
+| Start Threads | Initial Delay (s) | Startup Time (s) | Hold Load (s) | Shutdown Time (s) |
+|---|---|---|---|---|
+| 50 | 0 | 60 | 300 | 60 |
+| 150 | 360 | 120 | 600 | 60 |
+| 30 | 1140 | 30 | 300 | 30 |
+
+**Meaning:** Row 1 ramps to 50 users over 60s, holds 5 min. Row 2 (starting at the 360s mark) ramps to an additional 150 users, holds 10 min (this is your peak/spike). Row 3 tapers down to a light 30-user tail.
+
+**Telco use case:** Simulating a **promotional recharge campaign launch** — normal baseline traffic (50 users), then a sudden marketing SMS blast drives a spike to 150 concurrent users hitting the Recharge API, then traffic settles to a long tail as the promo winds down. Custom, non-linear shape — exactly what Ultimate TG is built for.
+
+---
+
+## 3. Arrivals Thread Group
+
+**Config:**
+- Target Rate = `200` arrivals per `minute`
+- Ramp-up time = `60` sec
+- Steady state = `600` sec
+- Ramp-down time = `60` sec
+- Processing threads: engine auto-calculates based on response time (open model — doesn't need manual thread math)
+
+**Meaning:** You specify "I want 200 new virtual users arriving per minute" — JMeter figures out how many threads it needs to sustain that arrival rate, regardless of how slow the backend responds.
+
+**Telco use case:** Modeling **CDR event arrival rate from the network** — real CDRs don't wait for JMeter's previous "thread" to finish before the next one exists; they arrive independently based on actual call/SMS/data activity. Arrivals TG matches this real-world open-system behavior far better than a closed Standard Thread Group would.
+
+---
+
+## 4. Free-Form Arrivals Thread Group
+
+**Config (table, irregular arrival pattern):**
+
+| Start RPS | End RPS | Duration (s) |
+|---|---|---|
+| 10 | 10 | 300 (quiet night traffic) |
+| 10 | 500 | 60 (sudden morning surge) |
+| 500 | 500 | 1800 (busy hour) |
+| 500 | 50 | 300 (drop after lunch) |
+| 50 | 400 | 120 (evening spike — promo notification burst) |
+| 400 | 20 | 600 (night taper) |
+
+**Telco use case:** Replaying a **realistic 24-hour subscriber traffic curve** captured from actual production logs (low overnight, morning commute spike, midday steady, evening promo burst, late-night taper) — irregular, not a clean linear ramp, which is exactly what Free-Form Arrivals is designed to replicate versus the standard Arrivals TG's simpler consistent ramp.
+
+---
+
+## 5. Concurrency Thread Group (+ Throughput Shaping Timer)
+
+**Concurrency Thread Group config:**
+- Target Concurrency = `300`
+- Ramp-up Time = `120` sec
+- Ramp-up Steps Count = `10`
+- Hold Target Rate Time = `1800` sec
+
+**Paired Throughput Shaping Timer config (graph):**
+
+| Time (s) | Target TPS |
+|---|---|
+| 0 | 50 |
+| 300 | 1000 |
+| 1800 | 1000 |
+| 2100 | 100 |
+
+**Meaning:** Concurrency TG supplies enough threads (up to 300) to physically be capable of hitting the load; Throughput Shaping Timer is the one actually **dictating the real TPS target over time** — the two work together, TG provides capacity, Timer provides the precise pacing.
+
+**Telco use case:** **Real-time charging (OCS) busy-hour test** — SLA requires sustaining exactly 1000 TPS during the 30-minute busy hour window, ramping up over 5 minutes and tapering after. This is the most accurate way to hit a *precise* throughput target (not just "however many threads happen to produce"), which matters enormously for revenue-critical charging systems where both under-testing and over-testing give misleading capacity numbers.
+
+---
+
+## Quick comparison table for your notebook
+
+| Thread Group | Controls by | Best for |
+|---|---|---|
+| Stepping | Thread count, stepped | Finding breakpoint/capacity ceiling |
+| Ultimate | Custom table (threads over time) | Arbitrary/custom shapes, spike simulation |
+| Arrivals | Arrival rate (open model) | Matching real independent-arrival systems (CDRs) |
+| Free-Form Arrivals | Irregular rate table | Replaying real, non-linear production traffic curves |
+| Concurrency + Throughput Shaping Timer | Precise TPS over time | SLA-driven exact throughput targets (charging, billing) |
+
+For your CelcomDigi-style work, **Concurrency TG + Throughput Shaping Timer** is the one you'll want to be able to configure live/whiteboard in an interview — it's the most commonly asked "design a busy-hour load test" scenario at senior level.
 **Advanced concept — Closed vs Open system models:**
 - Standard/Concurrency TG = **closed model** (fixed thread pool, new request only after previous completes — thread "waits")
 - Arrivals TG = **open model** (new virtual users arrive at a rate regardless of whether previous ones finished — mimics real internet traffic better)
