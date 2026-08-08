@@ -669,3 +669,252 @@ Caution: file I/O from every thread adds contention at high concurrency — pref
 | `AssertionResult` | JSR223 Assertion only | `setFailure()`, `setFailureMessage()` |
 
 **Performance tip:** always favor `JsonSlurper`/`JsonBuilder` over manual regex for JSON — it's both cleaner and avoids catastrophic backtracking regex can hit on large payloads. Cache compiled scripts (Script Compilation Cache: enable "Cache compiled script if available" checkbox in JSR223 elements) to avoid re-parsing Groovy on every iteration at scale.
+
+
+# JSR223 Sampler — Simulating 3PP (Third-Party Provider) Dummy Responses in JMeter
+
+Use case: downstream systems (credit bureau, billing engine, SIM provisioning, device inventory,
+payment gateway) aren't available, rate-limited, or too fragile for full load — so you stub them
+with a JSR223 Sampler that *acts like* the 3PP, returning realistic JSON with controllable
+latency, error rate, and payload shape. This keeps your pipeline (Kafka producers, downstream
+listeners, correlation logic) exercised end-to-end without hammering the real system.
+
+---
+
+## 1. Basic dummy JSON response (JSR223 Sampler, not PostProcessor)
+
+```groovy
+import groovy.json.JsonBuilder
+
+def orderId = vars.get("orderId") ?: "ORD-UNKNOWN"
+
+def response = new JsonBuilder()
+response {
+    orderId orderId
+    status "SUCCESS"
+    provisioningRef "PROV-" + System.currentTimeMillis()
+    timestamp new Date().format("yyyy-MM-dd'T'HH:mm:ss")
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+SampleResult.setResponseCode("200")
+SampleResult.setSuccessful(true)
+SampleResult.setResponseMessage("OK")
+```
+Note: in a JSR223 **Sampler**, the injected result object is `SampleResult` (capital S), not `prev`.
+`prev` is only valid in PostProcessors/Assertions referencing the *previous* sampler.
+
+---
+
+## 2. Simulating realistic network latency (so downstream timers/SLA logic behave normally)
+
+```groovy
+import groovy.json.JsonBuilder
+
+// Simulate 3PP latency distribution — most calls fast, some slow (long tail)
+def rand = new Random()
+def latencyMs = (rand.nextInt(100) < 90) ?
+    (150 + rand.nextInt(200)) :      // 90% of calls: 150-350ms
+    (1000 + rand.nextInt(2000))      // 10% of calls: 1-3s (simulates 3PP slowness)
+
+Thread.sleep(latencyMs)
+
+def response = new JsonBuilder()
+response {
+    creditCheckResult "APPROVED"
+    latencyMs latencyMs
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+SampleResult.setResponseCode("200")
+SampleResult.setSuccessful(true)
+```
+Caution: `Thread.sleep` inside a sampler blocks the thread for that duration — factor this into
+your thread group math the same as you would real 3PP latency (don't let it distort throughput
+calcs unexpectedly).
+
+---
+
+## 3. Simulating error rates / partial failures (chaos-style dummy for negative-path testing)
+
+```groovy
+import groovy.json.JsonBuilder
+
+def rand = new Random().nextInt(100)
+def response = new JsonBuilder()
+
+if (rand < 85) {
+    // 85% success
+    response {
+        status "SUCCESS"
+        billingAccountId "BA-" + (100000 + new Random().nextInt(899999))
+    }
+    SampleResult.setResponseCode("200")
+    SampleResult.setSuccessful(true)
+
+} else if (rand < 95) {
+    // 10% business-rule failure (still HTTP 200 in many billing APIs — status is in payload)
+    response {
+        status "FAILED"
+        errorCode "BILLING_ACCOUNT_LOCKED"
+        message "Account under dispute hold"
+    }
+    SampleResult.setResponseCode("200")
+    SampleResult.setSuccessful(true)   // functionally valid response, just a business failure
+
+} else {
+    // 5% hard failure (simulates 3PP outage/timeout)
+    response {
+        status "ERROR"
+        message "Upstream billing service unavailable"
+    }
+    SampleResult.setResponseCode("503")
+    SampleResult.setSuccessful(false)
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+```
+This is the pattern to use when you need your **error-handling / retry logic** (Kafka DLQ,
+compensation flow, alerting) exercised under load, not just the happy path.
+
+---
+
+## 4. Request-aware dummy — reading the incoming request body and echoing/deriving fields
+
+Useful when the next sampler in the chain depends on values from *this* request (e.g. provisioning
+dummy must reflect the plan code that was actually submitted).
+
+```groovy
+import groovy.json.JsonSlurper
+import groovy.json.JsonBuilder
+
+// SampleResult.getSamplerData() gives you what THIS sampler is about to "send"
+// if you've put the outgoing payload in the sampler's Body Data field
+def requestBody = sampler.getArguments()?.getArgument(0)?.getValue() ?: vars.get("requestPayload")
+
+def reqJson = new JsonSlurper().parseText(requestBody)
+def planCode = reqJson.planCode
+
+def response = new JsonBuilder()
+response {
+    orderId vars.get("orderId")
+    provisionedPlan planCode
+    status "PROVISIONED"
+    activationDate new Date().format("yyyy-MM-dd")
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+SampleResult.setResponseCode("200")
+SampleResult.setSuccessful(true)
+```
+Simpler alternative: since you likely built the request from `vars` in the first place (per the
+parameterization patterns), just reuse `vars.get("planCode")` directly instead of re-parsing —
+cheaper and avoids depending on sampler internals that vary by sampler type.
+
+---
+
+## 5. Dummy response with array payload (simulating a 3PP that returns multiple records — e.g. device inventory lookup)
+
+```groovy
+import groovy.json.JsonBuilder
+
+def skus = ["SKU-IPH15-BLK", "SKU-SGS24-WHT", "SKU-PIX9-BLU"]
+def stock = skus.collect { sku ->
+    [ sku: sku, available: new Random().nextBoolean(), qty: new Random().nextInt(50) ]
+}
+
+def response = new JsonBuilder()
+response {
+    warehouseId "WH-KL-01"
+    items stock
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+SampleResult.setResponseCode("200")
+SampleResult.setSuccessful(true)
+```
+
+---
+
+## 6. Stateful dummy — simulating a 3PP that changes behavior across calls (e.g. first call PENDING, later poll returns COMPLETED)
+
+Common for async provisioning/status-polling flows. Use `props` (JVM-shared) keyed by orderId to
+track fake "state" across a thread's poll loop.
+
+```groovy
+import groovy.json.JsonBuilder
+
+def orderId = vars.get("orderId")
+def key = "poll_count_" + orderId
+
+def pollCount = (props.get(key) ?: "0") as Integer
+pollCount++
+props.put(key, pollCount.toString())
+
+def response = new JsonBuilder()
+def status = (pollCount < 3) ? "IN_PROGRESS" : "COMPLETED"
+
+response {
+    orderId orderId
+    status status
+    pollAttempt pollCount
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+SampleResult.setResponseCode("200")
+SampleResult.setSuccessful(true)
+
+// downstream While Controller can loop on: ${status} != "COMPLETED"  (extract status via PostProcessor)
+```
+Remember to clean up `props` keys when the order completes (`props.remove(key)`), or a long
+soak/endurance run will leak memory-held state across thousands of order IDs.
+
+---
+
+## 7. Dummy response driven by a lookup table (deterministic test-data-driven mocking, not random)
+
+Useful when you need **reproducible** results tied to specific test input (e.g. specific MSISDN
+ranges always map to specific credit-check outcomes, for regression-style scenarios).
+
+```groovy
+import groovy.json.JsonBuilder
+
+def msisdn = vars.get("msisdn")
+def lastDigit = msisdn[-1] as Integer
+
+def creditResult
+switch (lastDigit) {
+    case { it in 0..6 }: creditResult = "APPROVED"; break
+    case 7:              creditResult = "REFERRED"; break
+    case 8:              creditResult = "DECLINED"; break
+    default:              creditResult = "APPROVED"
+}
+
+def response = new JsonBuilder()
+response {
+    msisdn msisdn
+    creditResult creditResult
+}
+
+SampleResult.setResponseData(response.toString(), "UTF-8")
+SampleResult.setResponseCode("200")
+SampleResult.setSuccessful(true)
+```
+
+---
+
+## Quick Reference — JSR223 Sampler-specific objects
+
+| Object | Notes |
+|---|---|
+| `SampleResult` | The result object you're building (capital S — this is the sampler's own result, unlike `prev`) |
+| `SampleResult.setResponseData(str, "UTF-8")` | Sets the mock response body |
+| `SampleResult.setResponseCode("200")` | Sets HTTP-style status code shown in listeners |
+| `SampleResult.setSuccessful(true/false)` | Drives pass/fail in reports and assertions downstream |
+| `SampleResult.setLatency(ms)` | Optionally override reported latency separate from `Thread.sleep` wall time |
+| `sampler` | Reference to the JSR223 Sampler element itself (rarely needed beyond `getArguments()`) |
+
+**Design note:** keep the dummy sampler's response *shape* identical to the real 3PP's contract
+(same field names, nesting, status enums). That way your correlation/assertion/PostProcessor
+scripts downstream don't need a separate code path for "mock mode" vs "real mode" — you just swap
+the sampler out when the real system becomes available for integration-level runs.
