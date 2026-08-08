@@ -391,7 +391,7 @@ Senior-level answer structure: "I follow a layered elimination approach rather t
 - **Licensing limits** — LoadRunner's VUser licensing can cap how much load you can realistically generate, forcing scope compromises
 
 ---
-
+ 
 ## 6. BEST PRACTICES / SUCCESS FACTORS — How to Close an Interview Answer
 
 When asked "what makes a good performance test strategy," structure your answer around these pillars:
