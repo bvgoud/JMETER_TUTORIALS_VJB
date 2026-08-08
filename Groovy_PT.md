@@ -918,3 +918,349 @@ SampleResult.setSuccessful(true)
 (same field names, nesting, status enums). That way your correlation/assertion/PostProcessor
 scripts downstream don't need a separate code path for "mock mode" vs "real mode" — you just swap
 the sampler out when the real system becomes available for integration-level runs.
+
+
+
+---------------------------
+
+Project example:
+
+# Groovy Examples Mapped to Your Test Plan Structure
+
+Annotated version of your tree — Groovy wherever a scriptable element fits. Elements with no
+scripting angle (Recorder, Cookie Manager, plain Listeners config) are left as-is.
+
+---
+
+```
+TEST PLAN
+│
+├── Non-Test Elements — no Groovy relevant (recorder/mirror/property display are UI tools)
+│
+├── User Defined Variables (Config) — static, but can be COMPUTED at plan start via setUp instead
+│
+├── setUp Thread Group (runs FIRST, once, before everything)
+│   └── Pre-test setup: auth token gen, data seeding
+```
+
+### setUp Thread Group → Auth token generation (JSR223 Sampler)
+
+```groovy
+// JSR223 Sampler inside setUp Thread Group
+import groovy.json.JsonSlurper
+import org.apache.http.client.methods.HttpPost
+import org.apache.http.impl.client.HttpClients
+import org.apache.http.entity.StringEntity
+
+def client = HttpClients.createDefault()
+def post = new HttpPost("https://auth.internal.celcomdigi.local/oauth/token")
+post.setHeader("Content-Type", "application/json")
+post.setEntity(new StringEntity('{"grant_type":"client_credentials","client_id":"loadtest"}'))
+
+def resp = client.execute(post)
+def body = resp.getEntity().getContent().text
+def json = new JsonSlurper().parseText(body)
+
+// props = JVM-global, visible to every Thread Group for the whole test run
+props.put("globalAuthToken", json.access_token)
+log.info("setUp: obtained global auth token, expires_in=" + json.expires_in)
+
+client.close()
+```
+
+### setUp Thread Group → Data seeding (bulk pre-create test subscribers)
+
+```groovy
+// JSR223 Sampler — seed N test MSISDNs into props as a shared pool
+def seedCount = 100
+def pool = []
+
+(1..seedCount).each { i ->
+    def msisdn = "601" + (10000000 + i)
+    pool << msisdn
+}
+
+props.put("msisdnPool", pool.join(","))
+log.info("setUp: seeded ${pool.size()} test MSISDNs")
+```
+Main Thread Groups later pull one each via `props.get("msisdnPool").split(",")[ctx.getThreadNum()]`.
+
+```
+├── Thread Group(s) — main execution units
+│   │
+│   ├── Config Elements — mostly non-script (HTTP Defaults, Header/Cookie Manager, CSV, JDBC)
+│   │     Groovy angle: none directly, BUT JSR223 PreProcessor commonly reads these configs
+│   │
+│   ├── Timers — mostly non-script, BUT JSR223 Timer exists for custom pacing logic
+```
+
+### Timers → JSR223 Timer (custom think-time logic, e.g. time-of-day based pacing)
+
+```groovy
+// JSR223 Timer — returns milliseconds to pause before next sampler
+def hour = new Date().hours
+
+// Simulate peak-hour vs off-peak pacing (busier hours = shorter think time)
+def delay = (hour >= 9 && hour <= 18) ? (500 + new Random().nextInt(500)) : (2000 + new Random().nextInt(1000))
+return delay
+```
+Note: JSR223 Timer must `return` a long/int — this is the one element where the return value
+itself (not a `vars.put`) is what JMeter consumes.
+
+```
+│   ├── Pre-Processors (scope: this level & below)
+│   │     JSR223 PreProcessor, User Parameters
+```
+
+### Pre-Processors → JSR223 PreProcessor (apply global auth token from setUp, per-thread data pick)
+
+```groovy
+// JSR223 PreProcessor at Thread Group level — runs before every sampler in scope
+vars.put("authToken", props.get("globalAuthToken"))
+
+def pool = props.get("msisdnPool")?.split(",")
+if (pool) {
+    def idx = ctx.getThreadNum() % pool.length
+    vars.put("msisdn", pool[idx])
+}
+```
+
+```
+│   ├── Logic Controllers
+│   │   │
+│   │   ├── Once Only Controller → Login (runs 1st iteration only)
+│   │   │     └── HTTP Request: Login
+│   │   │           ├── Post-Processor: Extract sessionToken
+│   │   │           └── Assertion: Response Assertion (check "SUCCESS")
+```
+
+### Once Only Controller → Login → Post-Processor: Extract sessionToken (JSR223 PostProcessor)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+vars.put("sessionToken", json.sessionToken)
+log.info("Login (1st iteration only): sessionToken acquired for thread " + ctx.getThreadNum())
+```
+
+### Once Only Controller → Login → Assertion (JSR223 Assertion, scripted alternative to Response Assertion)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+if (json.status != "SUCCESS") {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("Login failed for thread ${ctx.getThreadNum()}: " + json.status)
+}
+```
+Your tree already uses a plain Response Assertion here (correct, cheaper choice for a simple
+string-match). The JSR223 version above is only worth it if you need conditional logic beyond a
+single string/regex check — e.g. multiple valid success codes, or logging thread-specific detail.
+
+```
+│   │   └── Transaction Controller: "Place Order"
+│   │         └── If Controller (condition: stock available)
+```
+
+### If Controller → condition (JSR223-computed variable feeding the If Controller's condition field)
+
+```groovy
+// JSR223 PreProcessor attached just before the If Controller (or on a sampler feeding stock check)
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+def stockAvailable = (json.stockLevel as Integer) > 0
+vars.put("stockAvailable", stockAvailable.toString())
+```
+If Controller condition field: `${stockAvailable} == "true"` (or `"${__jexl3(...)}"` — but keep the
+boolean computed in Groovy, keep the If Controller field itself simple).
+
+```
+│   │               └── HTTP Request: Submit Order
+│   │                     ├── Pre-Processor: JSR223 (add signature header)
+│   │                     ├── Post-Processor: JSON Extractor (orderId)
+│   │                     ├── Assertion: JSON Assertion (status = CONFIRMED)
+│   │                     └── Assertion: Duration Assertion (<2000ms)
+```
+
+### Submit Order → Pre-Processor: JSR223 (add HMAC signature header — as named in your tree)
+
+```groovy
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
+def secret = props.get("hmacSecret") ?: "loadtest-secret-key"
+def payload = vars.get("orderPayload") ?: sampler.getArguments().getArgument(0).getValue()
+
+def mac = Mac.getInstance("HmacSHA256")
+mac.init(new SecretKeySpec(secret.getBytes("UTF-8"), "HmacSHA256"))
+def signatureBytes = mac.doFinal(payload.getBytes("UTF-8"))
+def signature = signatureBytes.encodeHex().toString()
+
+sampler.getHeaderManager().add(new org.apache.jmeter.protocol.http.control.Header("X-Signature", signature))
+vars.put("requestSignature", signature)
+```
+
+### Submit Order → Post-Processor: orderId (Groovy alternative to JSON Extractor, when you need more than one field or conditional logic)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+vars.put("orderId", json.orderId)
+vars.put("orderStatus", json.status)
+vars.put("estimatedCompletionTime", json.eta ?: "N/A")
+```
+Your tree's plain **JSON Extractor** is the right call for a single-field pull like `orderId` alone
+— it's lighter-weight than JSR223. Reach for Groovy here only when you need multiple derived
+fields, conditional branching, or math on the extracted values in the same step.
+
+### Submit Order → Assertion: JSON Assertion (Groovy alternative when checking beyond a single equality)
+
+```groovy
+import groovy.json.JsonSlurper
+
+def json = new JsonSlurper().parseText(prev.getResponseDataAsString())
+
+if (json.status != "CONFIRMED") {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("Expected CONFIRMED, got ${json.status}")
+}
+// Extra check your plain JSON Assertion can't easily express: cross-field validation
+if (json.orderId == null || json.confirmationNumber == null) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("CONFIRMED status but missing orderId/confirmationNumber")
+}
+```
+
+### Submit Order → Assertion: Duration (Groovy alternative — useful to log near-miss SLA breaches, not just pass/fail)
+
+```groovy
+def elapsed = prev.getTime()
+def slaMs = 2000
+
+if (elapsed > slaMs) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage("Duration ${elapsed}ms exceeded ${slaMs}ms SLA")
+} else if (elapsed > (slaMs * 0.8)) {
+    // near-miss — doesn't fail, but flags for trend analysis
+    log.warn("Near-SLA-breach: ${elapsed}ms (80% of ${slaMs}ms threshold) for orderId=" + vars.get("orderId"))
+}
+```
+Plain Duration Assertion is fine for a hard pass/fail. This variant earns its keep if you want the
+"approaching SLA" signal in logs for early-warning trend analysis during a soak run.
+
+```
+│   ├── Samplers
+│   │     HTTP Request, JDBC Request, Kafka Sampler, JSR223 Sampler
+```
+
+### Samplers → JSR223 Sampler (e.g. custom Kafka consumer poll not covered by a plugin)
+
+```groovy
+import org.apache.kafka.clients.consumer.KafkaConsumer
+import org.apache.kafka.clients.consumer.ConsumerRecords
+import java.time.Duration
+
+// Reuse consumer across iterations via props (avoid reconnect overhead per sample)
+if (props.get("kafkaConsumer") == null) {
+    def configProps = new Properties()
+    configProps.put("bootstrap.servers", "kafka-broker:9092")
+    configProps.put("group.id", "loadtest-cdr-consumer")
+    configProps.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
+    configProps.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer")
+
+    def consumer = new KafkaConsumer(configProps)
+    consumer.subscribe(["cdr-events"])
+    props.put("kafkaConsumer", consumer)
+}
+
+def consumer = props.get("kafkaConsumer")
+ConsumerRecords records = consumer.poll(Duration.ofMillis(2000))
+
+SampleResult.sampleStart()
+def found = false
+records.each { record ->
+    if (record.value().contains(vars.get("orderId"))) {
+        found = true
+        SampleResult.setResponseData(record.value(), "UTF-8")
+    }
+}
+SampleResult.sampleEnd()
+SampleResult.setSuccessful(found)
+SampleResult.setResponseCode(found ? "200" : "404")
+```
+
+```
+│   └── Listeners
+│         Simple Data Writer (.jtl) — ALWAYS ON
+│         Backend Listener (Grafana/Datadog) — optional
+│         View Results Tree / Summary Report — DEBUG ONLY
+```
+
+### Listeners → note on Groovy here
+
+Listeners themselves aren't scriptable — but the **Backend Listener** config often pairs with a
+JSR223 PreProcessor upstream that pushes custom metrics via `props`/`vars` for InfluxDB/Grafana
+tagging (e.g. tagging samples with `orderType` so Grafana can break down latency by order type).
+Example, placed just before the sampler you want tagged:
+
+```groovy
+// Tags this sample for Backend Listener / InfluxDB dimension breakdown
+sampler.setComment("orderType=" + vars.get("orderType") + ";stockAvailable=" + vars.get("stockAvailable"))
+```
+
+```
+├── tearDown Thread Group (runs LAST, once, after everything)
+│   └── Cleanup: delete test data, close sessions
+```
+
+### tearDown Thread Group → Cleanup (JSR223 Sampler)
+
+```groovy
+import org.apache.http.client.methods.HttpDelete
+import org.apache.http.impl.client.HttpClients
+
+// Close pooled Kafka consumer opened in the main Thread Group
+def consumer = props.get("kafkaConsumer")
+if (consumer != null) {
+    consumer.close()
+    log.info("tearDown: Kafka consumer closed")
+}
+
+// Delete seeded test subscribers
+def pool = props.get("msisdnPool")?.split(",")
+def client = HttpClients.createDefault()
+
+pool?.each { msisdn ->
+    def del = new HttpDelete("https://api.internal.celcomdigi.local/subscribers/" + msisdn)
+    del.setHeader("Authorization", "Bearer " + props.get("globalAuthToken"))
+    try {
+        client.execute(del)
+    } catch (Exception e) {
+        log.error("tearDown: failed to delete ${msisdn} - " + e.message)
+    }
+}
+client.close()
+log.info("tearDown: cleanup complete")
+```
+
+---
+
+## Where Groovy is worth it vs. where it isn't (summary)
+
+| Tree node | Use built-in element | Use JSR223 instead when... |
+|---|---|---|
+| Login assertion | Response Assertion | You need multi-condition or logged detail |
+| orderId extraction | JSON Extractor | You need multiple fields / derived values in one step |
+| Duration check | Duration Assertion | You want near-miss logging, not just hard fail |
+| Timers | Constant/Uniform Timer | You need computed, time-of-day, or data-driven pacing |
+| Config elements | HTTP Defaults, CSV Config | Rarely — these are declarative by design, leave them alone |
+
+General rule from a performance-engineering standpoint: **don't JSR223-ify things that a built-in
+element already does well** — every JSR223 script costs more CPU per sample than a native element,
+and at high thread counts that overhead is real. Reach for Groovy specifically where you need
+branching, multi-field logic, external system calls (Kafka, HMAC, custom auth), or state that
+spans requests.
